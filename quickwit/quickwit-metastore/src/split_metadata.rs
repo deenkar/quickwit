@@ -20,6 +20,7 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use bytesize::ByteSize;
+use quickwit_proto::metastore::SplitRecoveryMetadata;
 use quickwit_proto::types::{DocMappingUid, IndexUid, SourceId, SplitId};
 use serde::{Deserialize, Serialize};
 use serde_with::{DurationMilliSeconds, serde_as};
@@ -181,6 +182,74 @@ impl fmt::Debug for SplitMetadata {
 }
 
 impl SplitMetadata {
+    /// Reconstructs metastore split metadata and its direct parents from metadata embedded in a
+    /// split bundle.
+    pub fn try_from_recovery_metadata(
+        recovery_metadata: SplitRecoveryMetadata,
+    ) -> anyhow::Result<(Self, Vec<SplitId>)> {
+        let SplitRecoveryMetadata {
+            split_id,
+            index_uid,
+            source_id,
+            node_id,
+            doc_mapping_uid,
+            partition_id,
+            num_docs,
+            uncompressed_docs_size_in_bytes,
+            time_range_start,
+            time_range_end,
+            create_timestamp,
+            mature,
+            maturation_period_secs,
+            tags,
+            delete_opstamp,
+            num_merge_ops,
+            parent_split_ids,
+            footer_start,
+            footer_end,
+        } = recovery_metadata;
+        let time_range = match (time_range_start, time_range_end) {
+            (Some(start), Some(end)) if start <= end => Some(start..=end),
+            (None, None) => None,
+            (Some(start), Some(end)) => {
+                anyhow::bail!("invalid recovery time range: start {start} is after end {end}")
+            }
+            _ => anyhow::bail!("recovery time range must contain both start and end"),
+        };
+        let footer_start = footer_start
+            .ok_or_else(|| anyhow::anyhow!("missing recovery footer start offset"))?;
+        let footer_end =
+            footer_end.ok_or_else(|| anyhow::anyhow!("missing recovery footer end offset"))?;
+        anyhow::ensure!(footer_start < footer_end, "invalid recovery footer offsets");
+        let maturity = if mature {
+            SplitMaturity::Mature
+        } else {
+            SplitMaturity::Immature {
+                maturation_period: Duration::from_secs(maturation_period_secs),
+            }
+        };
+        let split_metadata = Self {
+            split_id: split_id.into(),
+            index_uid: index_uid.ok_or_else(|| anyhow::anyhow!("missing recovery index UID"))?,
+            partition_id,
+            source_id,
+            node_id,
+            num_docs: num_docs.try_into()?,
+            uncompressed_docs_size_in_bytes,
+            time_range,
+            create_timestamp,
+            maturity,
+            tags: tags.into_iter().collect(),
+            footer_offsets: footer_start..footer_end,
+            delete_opstamp,
+            num_merge_ops: num_merge_ops.try_into()?,
+            doc_mapping_uid: doc_mapping_uid
+                .ok_or_else(|| anyhow::anyhow!("missing recovery doc mapping UID"))?,
+        };
+        let parent_split_ids = parent_split_ids.into_iter().map(SplitId::from).collect();
+        Ok((split_metadata, parent_split_ids))
+    }
+
     /// Creates a new instance of split metadata.
     pub fn new(
         split_id: SplitId,

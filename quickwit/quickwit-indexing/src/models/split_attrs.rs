@@ -67,6 +67,7 @@ pub struct SplitAttrs {
 
     // Number of merge operation the split has been through so far.
     pub num_merge_ops: usize,
+
 }
 
 impl fmt::Debug for SplitAttrs {

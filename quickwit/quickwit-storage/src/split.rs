@@ -23,7 +23,7 @@ use aws_sdk_s3::primitives::{ByteStream, FsBuilder, Length, SdkBody};
 use futures::{Stream, StreamExt, stream};
 use hyper::body::{Bytes, Frame};
 use pin_project::pin_project;
-use quickwit_common::shared_consts::SPLIT_FIELDS_FILE_NAME;
+use quickwit_common::shared_consts::{SPLIT_FIELDS_FILE_NAME, SPLIT_RECOVERY_METADATA_FILE_NAME};
 
 use crate::bundle_storage::BundleStorageFileOffsetsVersions;
 use crate::{BundleStorageFileOffsets, PutPayload, VersionedComponent};
@@ -149,6 +149,21 @@ impl SplitPayloadBuilder {
         serialized_split_fields: &[u8],
         hotcache: &[u8],
     ) -> anyhow::Result<SplitPayload> {
+        Self::get_split_payload_with_recovery_metadata(
+            split_files,
+            serialized_split_fields,
+            None,
+            hotcache,
+        )
+    }
+
+    /// Creates a split payload and embeds recovery metadata as an additional bundle entry.
+    pub fn get_split_payload_with_recovery_metadata(
+        split_files: &[PathBuf],
+        serialized_split_fields: &[u8],
+        serialized_recovery_metadata: Option<&[u8]>,
+        hotcache: &[u8],
+    ) -> anyhow::Result<SplitPayload> {
         let mut split_payload_builder = SplitPayloadBuilder::default();
         for file in split_files {
             split_payload_builder.add_file(file)?;
@@ -157,6 +172,12 @@ impl SplitPayloadBuilder {
             SPLIT_FIELDS_FILE_NAME.to_string(),
             Box::new(serialized_split_fields.to_vec()),
         );
+        if let Some(serialized_recovery_metadata) = serialized_recovery_metadata {
+            split_payload_builder.add_payload(
+                SPLIT_RECOVERY_METADATA_FILE_NAME.to_string(),
+                Box::new(serialized_recovery_metadata.to_vec()),
+            );
+        }
         let offsets = split_payload_builder.finalize(hotcache)?;
         Ok(offsets)
     }
@@ -299,6 +320,25 @@ mod tests {
 
         assert_eq!(split_payload.len(), 128);
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_split_payload_embeds_recovery_metadata() -> anyhow::Result<()> {
+        let recovery_metadata = b"recovery-protobuf";
+        let split_payload = SplitPayloadBuilder::get_split_payload_with_recovery_metadata(
+            &[],
+            b"fields",
+            Some(recovery_metadata),
+            b"hotcache",
+        )?;
+
+        let recovery_range =
+            b"fields".len() as u64..(b"fields".len() + recovery_metadata.len()) as u64;
+        assert_eq!(
+            fetch_data(&split_payload, recovery_range).await?,
+            recovery_metadata
+        );
         Ok(())
     }
 

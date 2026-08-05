@@ -296,8 +296,20 @@ pub fn mock_split_meta(split_id: &str, index_uid: &IndexUid) -> SplitMetadata {
 
 #[cfg(test)]
 mod tests {
-    use quickwit_metastore::{ListSplitsRequestExt, MetastoreServiceStreamSplitsExt};
-    use quickwit_proto::metastore::{ListSplitsRequest, MetastoreService};
+    use std::path::Path;
+    use std::sync::Arc;
+
+    use quickwit_common::shared_consts::SPLIT_RECOVERY_METADATA_FILE_NAME;
+    use quickwit_config::IndexConfig;
+    use quickwit_metastore::{
+        CreateIndexRequestExt, FileBackedMetastore, ListSplitsRequestExt,
+        MetastoreServiceStreamSplitsExt, SplitMetadata, StageSplitsRequestExt,
+    };
+    use quickwit_proto::metastore::{
+        CreateIndexRequest, ListSplitsRequest, MetastoreService, PublishSplitsRequest,
+        SplitRecoveryMetadata, StageSplitsRequest,
+    };
+    use quickwit_storage::{BundleStorage, RamStorage, Storage};
 
     use super::TestSandbox;
 
@@ -344,6 +356,105 @@ mod tests {
                 .await?;
             assert_eq!(splits.len(), 2);
         }
+        test_sandbox.assert_quit().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_recover_split_from_bundle_and_publish_it() -> anyhow::Result<()> {
+        let index_id = quickwit_common::rand::append_random_suffix("split-recovery");
+        let test_sandbox = TestSandbox::create(
+            &index_id,
+            r#"
+                timestamp_field: timestamp
+                field_mappings:
+                  - name: timestamp
+                    type: datetime
+                    fast: true
+                  - name: body
+                    type: text
+            "#,
+            "{}",
+            &["body"],
+        )
+        .await?;
+        test_sandbox
+            .add_documents([serde_json::json!({
+                "timestamp": 1_700_000_000,
+                "body": "recover me"
+            })])
+            .await?;
+
+        let original_splits = test_sandbox
+            .metastore()
+            .list_splits(ListSplitsRequest::try_from_index_uid(
+                test_sandbox.index_uid(),
+            )?)
+            .await?
+            .collect_splits()
+            .await?;
+        assert_eq!(original_splits.len(), 1);
+        let original_metadata = &original_splits[0].split_metadata;
+
+        // Load the split bundle from object storage and read its embedded recovery entry.
+        let split_filename = quickwit_common::split_file(original_metadata.split_id());
+        let split_path = Path::new(&split_filename);
+        let storage = test_sandbox.storage();
+        let split_bytes = storage.get_all(split_path).await?;
+        let (_hotcache, split_bundle) = BundleStorage::open_from_split_data_with_owned_bytes(
+            storage,
+            split_path.to_path_buf(),
+            split_bytes,
+        )?;
+        let serialized_recovery_metadata = split_bundle
+            .get_all(Path::new(SPLIT_RECOVERY_METADATA_FILE_NAME))
+            .await?;
+        let recovery_metadata =
+            SplitRecoveryMetadata::deserialize(serialized_recovery_metadata.as_ref())?;
+        let (mut recovered_metadata, parent_split_ids) =
+            SplitMetadata::try_from_recovery_metadata(recovery_metadata)?;
+
+        assert!(parent_split_ids.is_empty());
+        assert_eq!(&recovered_metadata, original_metadata);
+
+        // Simulate a lost metastore by creating the index in a new one. Index creation assigns a
+        // new incarnation UID, so the importer explicitly remaps the recovered split to it.
+        let fresh_metastore =
+            FileBackedMetastore::try_new(Arc::new(RamStorage::default()), None).await?;
+        let index_config = IndexConfig::for_test(&index_id, "ram:///recovered-index");
+        let recovered_index_uid = fresh_metastore
+            .create_index(CreateIndexRequest::try_from_index_config(&index_config)?)
+            .await?
+            .index_uid()
+            .clone();
+        recovered_metadata.index_uid = recovered_index_uid.clone();
+
+        fresh_metastore
+            .stage_splits(StageSplitsRequest::try_from_split_metadata(
+                recovered_index_uid.clone(),
+                &recovered_metadata,
+            )?)
+            .await?;
+        fresh_metastore
+            .publish_splits(PublishSplitsRequest {
+                index_uid: Some(recovered_index_uid.clone()),
+                staged_split_ids: vec![recovered_metadata.split_id.to_string()],
+                ..Default::default()
+            })
+            .await?;
+
+        let published_splits = fresh_metastore
+            .list_splits(ListSplitsRequest::try_from_index_uid(recovered_index_uid)?)
+            .await?
+            .collect_splits()
+            .await?;
+        assert_eq!(published_splits.len(), 1);
+        assert_eq!(
+            published_splits[0].split_state,
+            super::SplitState::Published
+        );
+        assert_eq!(published_splits[0].split_metadata, recovered_metadata);
+
         test_sandbox.assert_quit().await;
         Ok(())
     }
